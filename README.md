@@ -1,6 +1,6 @@
 # rouman-chapter-download
 
-一个用于 Rouman 漫画的 Codex skill：下载用户指定的章节图片，按页面顺序编号，并生成带有上一章、目录和下一章导航的无间距离线 HTML 阅读页。默认不生成 PDF。
+一个用于 Rouman 漫画的 Codex skill：下载用户指定的章节图片，按页面顺序编号，保存网站原始章节名，并生成带有上一章、目录和下一章导航的无间距离线 HTML 阅读页。默认不生成 PDF。
 
 ## 效果预览
 
@@ -10,7 +10,7 @@
 
 ### 整本目录
 
-![离线目录页，展示已保存章节和图片数量](docs/images/index-preview.png)
+![离线目录页，以原始章节名显示三列阅读链接](docs/images/index-preview.png)
 
 ### 章节阅读页
 
@@ -32,9 +32,12 @@ python -m pip install -r requirements.txt
 python skills/rouman-chapter-download/scripts/rouman_downloader.py https://rouman5.com/books/BOOK_ID --list
 python skills/rouman-chapter-download/scripts/rouman_downloader.py https://rouman5.com/books/BOOK_ID --chapter 0
 python skills/rouman-chapter-download/scripts/rouman_downloader.py https://rouman5.com/books/BOOK_ID --all
+python skills/rouman-chapter-download/scripts/rouman_downloader.py https://rouman5.com/books/BOOK_ID --refresh-index
 ```
 
-章节 URL 的 `/0` 对应本地 `chapter_001`。默认将每本漫画存放在运行命令时所在目录的 `downloads/` 下；使用 `--out <目录>` 可自行选择保存位置。章节阅读页直接读取本地图片，整本目录为 `index.html`。
+章节 URL 的 `/0` 对应本地 `chapter_001`。默认将每本漫画存放在运行命令时所在目录的 `downloads/` 下；使用 `--out <目录>` 可自行选择保存位置。章节阅读页直接读取本地图片，整本目录为 `index.html`。原始章节名保存在 `chapters/chapter_titles.json`，目录页将“章节名”和“打开阅读页”合并为一个链接，并按桌面三列、窄屏两列、手机一列排列。
+
+已有下载如果缺少章节名，可以运行 `--refresh-index`；它只更新标题缓存、目录和章节导航，不会重新下载图片。
 
 旧版书籍如果把 `chapter_XXX/` 和 `chapter_XXX.html` 直接放在书籍根目录，请先备份，再显式迁移：
 
@@ -55,6 +58,7 @@ BOOK_ID/
 │   ├── chapter_001/
 │   └── chapter_002/
 └── chapters/
+    ├── chapter_titles.json
     ├── chapter_001.html
     └── chapter_002.html
 ```
@@ -67,6 +71,8 @@ BOOK_ID/
 skills/rouman-chapter-download/
 ├── SKILL.md
 └── scripts/rouman_downloader.py
+docs/images/
+tests/test_rouman_downloader.py
 requirements.txt
 ```
 

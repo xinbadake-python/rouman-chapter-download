@@ -7,7 +7,7 @@ description: Download explicitly selected Rouman chapters as ordered images with
 
 Use `scripts/rouman_downloader.py` for chapters the user asks to save. The script reads chapter image URLs from the site's `imagePaths` page data, downloads the images in page order, and reconstructs images marked `sr:1` using the strip order implemented by the site's reader. Images marked `sr:0` are saved in their detected source format.
 
-The script groups numbered images under `images/chapter_XXX/`, writes chapter readers under `chapters/`, and keeps only the book-level `index.html` at book root. Each reader has top and bottom links for the previous downloaded chapter, the book index, and the next downloaded chapter. Books are saved under `downloads/` relative to the current working directory by default, with one child folder per book ID. A renamed existing folder is reused when its index records the same book URL. Use `--out` to change the parent folder. Do not generate PDFs unless the user explicitly requests that format. If requested, `--continuous-pdf` joins adjacent tiles into taller pages (up to 12,000 pixels high), while `--pdf` creates one page per image.
+The script groups numbered images under `images/chapter_XXX/`, writes chapter readers under `chapters/`, and keeps only the book-level `index.html` at book root. It preserves the site's original chapter names in `chapters/chapter_titles.json`; the book index presents one titled reader link per chapter in a responsive three-, two-, or one-column grid. Each reader has top and bottom links for the previous downloaded chapter, the book index, and the next downloaded chapter. Books are saved under `downloads/` relative to the current working directory by default, with one child folder per book ID. A renamed existing folder is reused when its index records the same book URL. Use `--out` to change the parent folder. Do not generate PDFs unless the user explicitly requests that format. If requested, `--continuous-pdf` joins adjacent tiles into taller pages (up to 12,000 pixels high), while `--pdf` creates one page per image.
 
 ## Scope and run
 
@@ -20,10 +20,11 @@ The script groups numbered images under `images/chapter_XXX/`, writes chapter re
    ```
 
 4. A legacy book with `chapter_XXX/` folders and `chapter_XXX.html` files at book root must be backed up and moved only with explicit user authorization. Run the same book URL with `--migrate-layout`; this performs no download and moves the existing content into `images/` and `chapters/` before regenerating readers and navigation.
-5. If a run is interrupted, repeat the same command. Completed image files are reused; each HTML reader is written after its chapter finishes, then the book index and navigation are refreshed.
+5. For an existing grouped book whose index lacks source chapter names, run the same book URL with `--refresh-index`. This fetches the current chapter catalog, saves the original names, and rebuilds only the local index and navigation; it does not download chapter images.
+6. If a run is interrupted, repeat the same command. Completed image files are reused; each HTML reader is written after its chapter finishes, then the book index and navigation are refreshed.
 
 ## Check the result
 
-- Compare each chapter's printed image count with its numbered files under `images/`, then check that readers under `chapters/` reference them in order and `index.html` links to the completed chapters. Verify the first, middle, and last reader navigation links. When a PDF was requested, also check its page count.
+- Compare each chapter's printed image count with its numbered files under `images/`, then check that readers under `chapters/` reference them in order. Confirm `chapter_titles.json` contains the source title for every downloaded chapter and `index.html` has exactly one titled link per completed reader, with no per-chapter image-count column. Verify the first, middle, and last reader navigation links. When a PDF was requested, also check its page count.
 - Check a representative joined boundary when diagnosing a reported visual seam. A display gap between two source tiles does not imply the saved image pixels contain a black line.
 - If the site's page data, CDN hosts, or image scrambling changes, inspect the current reader and update the script before downloading more chapters. The script accepts only Rouman book URLs and the observed CDN hosts (`kelv47.xyz` subdomains and `v1`–`v5.towm85.xyz`).

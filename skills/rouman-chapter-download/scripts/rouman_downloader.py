@@ -17,6 +17,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 from html import escape, unescape
+from html.parser import HTMLParser
 from io import BytesIO
 import json
 import os
@@ -39,6 +40,7 @@ CHAPTER_DIRECTORY = re.compile(r"chapter_\d{3}")
 CHAPTER_READER = re.compile(r"chapter_(\d{3})(?:_sample(\d+))?\.html")
 IMAGES_DIRECTORY = "images"
 READERS_DIRECTORY = "chapters"
+CHAPTER_TITLES_FILENAME = "chapter_titles.json"
 DEFAULT_LIBRARY_ROOT = Path("downloads")
 
 
@@ -102,16 +104,132 @@ def request_bytes(url: str, *, referer: str | None = None) -> tuple[bytes, str]:
     raise RuntimeError(f"Request failed after 3 attempts: {url}") from last_error
 
 
-def get_chapters(book_id: str, book_url: str) -> list[int]:
+class ChapterCatalogParser(HTMLParser):
+    """Extract the site's original chapter titles from one book page."""
+
+    def __init__(self, book_id: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.book_id = book_id
+        self.chapters: dict[int, str] = {}
+        self.current_index: int | None = None
+        self.collecting_title = False
+        self.title_attribute = ""
+        self.title_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "a":
+            href = attributes.get("href") or ""
+            classes = (attributes.get("class") or "").split()
+            match = re.fullmatch(rf"/books/{re.escape(self.book_id)}/(\d+)", href)
+            if match and "site-chapter-link" in classes:
+                self.current_index = int(match.group(1))
+        elif tag == "span" and self.current_index is not None:
+            self.collecting_title = True
+            self.title_attribute = attributes.get("title") or ""
+            self.title_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self.collecting_title:
+            self.title_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "span" and self.collecting_title and self.current_index is not None:
+            title = (self.title_attribute or "".join(self.title_text)).strip()
+            if title:
+                self.chapters[self.current_index] = title
+            self.collecting_title = False
+            self.title_attribute = ""
+            self.title_text = []
+        elif tag == "a":
+            self.current_index = None
+
+
+def parse_chapter_catalog(html: str, book_id: str) -> dict[int, str]:
+    """Return URL chapter indices mapped to their original displayed titles."""
+    parser = ChapterCatalogParser(book_id)
+    parser.feed(html)
+    parser.close()
+    chapters = dict(sorted(parser.chapters.items()))
+    if not chapters:
+        raise ValueError("No titled chapter links found in the book page")
+    return chapters
+
+
+def get_chapter_catalog(book_id: str, book_url: str) -> dict[int, str]:
     data, content_type = request_bytes(book_url)
     if "text/html" not in content_type:
         raise ValueError(f"Unexpected book page content type: {content_type}")
     html = data.decode("utf-8")
-    pattern = re.compile(rf'href="/books/{re.escape(book_id)}/(\d+)"')
-    indices = sorted({int(value) for value in pattern.findall(html)})
-    if not indices:
-        raise ValueError("No chapter links found in the book page")
-    return indices
+    return parse_chapter_catalog(html, book_id)
+
+
+def get_chapters(book_id: str, book_url: str) -> list[int]:
+    """Return available URL chapter indices, preserving the former API."""
+    return list(get_chapter_catalog(book_id, book_url))
+
+
+def chapter_titles_path(output_root: Path) -> Path:
+    return output_root / READERS_DIRECTORY / CHAPTER_TITLES_FILENAME
+
+
+def load_chapter_titles(output_root: Path, book_url: str) -> dict[int, str]:
+    """Load saved source titles when rebuilding an index offline."""
+    path = chapter_titles_path(output_root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("source") != book_url:
+        return {}
+    entries = payload.get("chapters")
+    if not isinstance(entries, list):
+        return {}
+    chapters: dict[int, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return {}
+        index = entry.get("index")
+        title = entry.get("title")
+        if not isinstance(index, int) or index < 0 or not isinstance(title, str):
+            return {}
+        title = title.strip()
+        if not title or index in chapters:
+            return {}
+        chapters[index] = title
+    return dict(sorted(chapters.items()))
+
+
+def save_chapter_titles(
+    output_root: Path,
+    book_url: str,
+    chapters: dict[int, str],
+) -> Path:
+    """Persist original source titles beside chapter readers, atomically."""
+    if not chapters:
+        raise ValueError("Cannot save an empty chapter catalog")
+    path = chapter_titles_path(output_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "source": book_url,
+        "chapters": [
+            {"index": index, "title": title}
+            for index, title in sorted(chapters.items())
+        ],
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == serialized:
+            return path
+    except (OSError, UnicodeError):
+        pass
+    temp_path = path.with_suffix(".part.json")
+    try:
+        temp_path.write_text(serialized, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return path
 
 
 def get_image_urls(chapter_url: str) -> list[str]:
@@ -518,8 +636,14 @@ def migrate_legacy_layout(output_root: Path) -> tuple[int, int]:
     return len(directory_moves), len(reader_moves)
 
 
-def make_book_index(output_root: Path, book_url: str) -> Path | None:
-    """Link completed local chapter readers without depending on PDFs."""
+def make_book_index(
+    output_root: Path,
+    book_url: str,
+    chapter_titles: dict[int, str] | None = None,
+) -> Path | None:
+    """Link completed readers in a compact grid using saved source titles."""
+    if chapter_titles is None:
+        chapter_titles = load_chapter_titles(output_root, book_url)
     readers: dict[int, tuple[Path, int | None, list[Path]]] = {}
     readers_root = output_root / READERS_DIRECTORY
     for html_path in readers_root.glob("chapter_*.html"):
@@ -538,7 +662,7 @@ def make_book_index(output_root: Path, book_url: str) -> Path | None:
             raise ValueError("Legacy chapter layout found; run with --migrate-layout first")
         return None
 
-    rows = []
+    items = []
     total_images = 0
     ordered_readers = sorted(readers.items())
     for position, (number, (html_path, sample, image_paths)) in enumerate(ordered_readers):
@@ -547,11 +671,13 @@ def make_book_index(output_root: Path, book_url: str) -> Path | None:
         if not update_reader_navigation(html_path, previous_path, next_path):
             make_html_reader(image_paths, html_path, previous_path, next_path)
         count = len(image_paths)
-        label = f"第 {number} 话" + (f"（试读 {sample} 张）" if sample else "")
+        label = chapter_titles.get(number - 1, f"第 {number} 话")
+        if sample:
+            label += f"（试读 {sample} 张）"
         href = html_path.relative_to(output_root).as_posix()
-        rows.append(
-            f'<tr><th scope="row">{escape(label)}</th><td>{count}</td>'
-            f'<td><a href="{escape(href, quote=True)}">打开阅读页</a></td></tr>'
+        items.append(
+            f'<a class="chapter-link" href="{escape(href, quote=True)}" '
+            f'title="{escape(label, quote=True)}">{escape(label)}</a>'
         )
         total_images += count
 
@@ -561,17 +687,22 @@ def make_book_index(output_root: Path, book_url: str) -> Path | None:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{escape(title)} · 离线阅读</title>
 <style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}
-body{{max-width:900px;margin:0 auto;padding:24px;background:#101114;color:#e9eaec}}
+*{{box-sizing:border-box}}
+body{{max-width:1120px;margin:0 auto;padding:28px 24px;background:#101114;color:#e9eaec}}
 p{{color:#b8bbc2;line-height:1.5}}a{{color:#88c5ff}}
-table{{width:100%;border-collapse:collapse;margin-top:22px}}
-th,td{{padding:10px 8px;text-align:left;border-bottom:1px solid #31343a}}
-@media(max-width:600px){{body{{padding:12px}}th,td{{padding:8px 4px;font-size:14px}}}}
+.chapter-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:24px}}
+.chapter-link{{display:block;padding:13px 15px;border:1px solid #30343b;border-radius:10px;
+background:#17191e;color:#a9d5ff;text-decoration:none;line-height:1.45;overflow-wrap:anywhere}}
+.chapter-link:hover{{border-color:#6fb8f5;background:#1d222a;color:#d5ebff}}
+.chapter-link:focus-visible{{outline:2px solid #88c5ff;outline-offset:2px}}
+@media(max-width:860px){{.chapter-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+@media(max-width:560px){{body{{padding:18px 12px}}.chapter-grid{{grid-template-columns:1fr}}}}
 </style></head><body>
 <h1>{escape(title)}</h1>
 <p>已保存 {len(readers)} 话 · {total_images:,} 张图片。阅读页直接使用本地图片，连续滚动阅读。</p>
 <p>来源：<a href="{escape(book_url, quote=True)}">{escape(book_url)}</a></p>
-<table><thead><tr><th>章节</th><th>图片</th><th>打开</th></tr></thead>
-<tbody>{''.join(rows)}</tbody></table></body></html>
+<nav class="chapter-grid" aria-label="章节目录">{''.join(items)}</nav>
+</body></html>
 """
     temp_path = output_root / "index.part.html"
     final_path = output_root / "index.html"
@@ -654,6 +785,10 @@ def main() -> int:
         "--migrate-layout", action="store_true",
         help="Move an existing flat book into images/ and chapters/ without downloading",
     )
+    group.add_argument(
+        "--refresh-index", action="store_true",
+        help="Fetch original chapter titles and rebuild an existing offline index",
+    )
     parser.add_argument(
         "--out", type=Path, default=DEFAULT_LIBRARY_ROOT,
         help="Parent folder for book downloads (default: %(default)s)",
@@ -687,22 +822,49 @@ def main() -> int:
             )
             print(f"Offline index: {index_path}")
             return 0
+        if args.refresh_index:
+            if has_legacy_layout(output_root):
+                raise ValueError("Legacy chapter layout found; run with --migrate-layout first")
+            chapter_titles = get_chapter_catalog(book_id, book_url)
+            titles_path = save_chapter_titles(output_root, book_url, chapter_titles)
+            index_path = make_book_index(output_root, book_url, chapter_titles)
+            if index_path is None:
+                raise ValueError(f"No local chapter readers found in {output_root}")
+            print(f"Saved chapter titles: {titles_path}")
+            print(f"Offline index: {index_path}")
+            return 0
+        chapter_titles: dict[int, str] = {}
         if args.all or args.list:
-            indices = get_chapters(book_id, book_url)
-            print(f"Available chapters ({len(indices)}): {', '.join(map(str, indices))}")
+            chapter_titles = get_chapter_catalog(book_id, book_url)
+            indices = list(chapter_titles)
+            print(f"Available chapters ({len(indices)}):")
+            for index in indices:
+                print(f"  {index}: {chapter_titles[index]}")
             if args.list:
                 return 0
         else:
             indices = [args.chapter if args.chapter is not None else (initial_chapter or 0)]
+            if args.html_reader:
+                try:
+                    chapter_titles = get_chapter_catalog(book_id, book_url)
+                except (HTTPError, URLError, OSError, ValueError, RuntimeError) as exc:
+                    chapter_titles = load_chapter_titles(output_root, book_url)
+                    print(
+                        f"Warning: could not refresh chapter titles ({exc}); "
+                        "using saved titles or numbered fallbacks",
+                        file=sys.stderr,
+                    )
         if has_legacy_layout(output_root):
             raise ValueError("Legacy chapter layout found; run with --migrate-layout first")
+        if args.html_reader and chapter_titles:
+            save_chapter_titles(output_root, book_url, chapter_titles)
         for index in indices:
             download_chapter(
                 book_url, index, output_root, args.workers, args.limit,
                 args.pdf, args.continuous_pdf, args.html_reader, args.overwrite_pdf
             )
             if args.html_reader:
-                index_path = make_book_index(output_root, book_url)
+                index_path = make_book_index(output_root, book_url, chapter_titles)
                 print(f"Offline index: {index_path}")
         return 0
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as exc:
