@@ -35,6 +35,10 @@ USER_AGENT = (
 )
 IMAGE_EXTENSIONS = ("webp", "jpg", "png", "gif")
 CHAPTER_PATHS = re.compile(r"imagePaths:\$R\[\d+\]=")
+CHAPTER_DIRECTORY = re.compile(r"chapter_\d{3}")
+CHAPTER_READER = re.compile(r"chapter_(\d{3})(?:_sample(\d+))?\.html")
+IMAGES_DIRECTORY = "images"
+READERS_DIRECTORY = "chapters"
 DEFAULT_LIBRARY_ROOT = Path("downloads")
 
 
@@ -302,7 +306,44 @@ def make_continuous_pdf(image_paths: list[Path], pdf_path: Path, overwrite: bool
         temp_path.unlink(missing_ok=True)
 
 
-def make_html_reader(image_paths: list[Path], html_path: Path) -> None:
+def relative_href(source_html: Path, target: Path) -> str:
+    """Return a browser-friendly relative path from one local HTML file."""
+    return Path(os.path.relpath(target, start=source_html.parent)).as_posix()
+
+
+def reader_navigation(
+    html_path: Path,
+    previous_path: Path | None,
+    next_path: Path | None,
+    placement: str,
+) -> str:
+    """Build one top or bottom navigation bar for a chapter reader."""
+    if previous_path is None:
+        previous = '<span class="disabled previous" aria-disabled="true">← 上一章</span>'
+    else:
+        href = escape(relative_href(html_path, previous_path), quote=True)
+        previous = f'<a class="previous" rel="prev" href="{href}">← 上一章</a>'
+    if next_path is None:
+        next_link = '<span class="disabled next" aria-disabled="true">下一章 →</span>'
+    else:
+        href = escape(relative_href(html_path, next_path), quote=True)
+        next_link = f'<a class="next" rel="next" href="{href}">下一章 →</a>'
+    index_path = html_path.parent.parent / "index.html"
+    index_href = escape(relative_href(html_path, index_path), quote=True)
+    return (
+        f'<!-- reader-nav-{placement}:start -->'
+        f'<nav class="reader-nav {placement}" aria-label="章节导航">'
+        f'{previous}<a class="index" href="{index_href}">目录</a>{next_link}'
+        f'</nav><!-- reader-nav-{placement}:end -->'
+    )
+
+
+def make_html_reader(
+    image_paths: list[Path],
+    html_path: Path,
+    previous_path: Path | None = None,
+    next_path: Path | None = None,
+) -> None:
     """Create a local chapter reader with no spacing between image tiles."""
     try:
         from PIL import Image
@@ -313,19 +354,35 @@ def make_html_reader(image_paths: list[Path], html_path: Path) -> None:
     for path in image_paths:
         with Image.open(path) as source:
             width, height = source.size
-        src = escape(f"{path.parent.name}/{path.name}", quote=True)
+        src = escape(relative_href(html_path, path), quote=True)
         tags.append(f'<img src="{src}" width="{width}" height="{height}" alt="">')
+    top_navigation = reader_navigation(html_path, previous_path, next_path, "top")
+    bottom_navigation = reader_navigation(html_path, previous_path, next_path, "bottom")
     markup = (
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         f"<title>{escape(title)}</title>"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<style>html,body{margin:0;padding:0;background:#000}"
+        "<style>:root{color-scheme:dark;font-family:system-ui,sans-serif}"
+        "html,body{margin:0;padding:0;background:#000;color:#f2f2f2}"
+        ".reader-nav{box-sizing:border-box;width:min(100%,720px);margin:0 auto;padding:10px 12px;"
+        "display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;"
+        "background:rgba(18,18,20,.94);font-size:15px;line-height:1.2;z-index:2}"
+        ".reader-nav.top{position:sticky;top:0}"
+        ".reader-nav.bottom{padding-top:18px;padding-bottom:22px}"
+        ".reader-nav a,.reader-nav span{padding:8px;color:#9ed0ff;text-decoration:none}"
+        ".reader-nav .index{text-align:center}.reader-nav .next{text-align:right}"
+        ".reader-nav .disabled{color:#666}"
         "main{width:min(100%,720px);margin:auto;line-height:0;font-size:0}"
         "img{display:block;width:100%;height:auto;margin:0;padding:0;border:0;vertical-align:top}"
-        "</style></head><body><main>"
+        "</style></head><body>"
+        + top_navigation
+        + "<main>"
         + "".join(tags)
-        + "</main></body></html>"
+        + "</main>"
+        + bottom_navigation
+        + "</body></html>"
     )
+    html_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = html_path.with_suffix(".part.html")
     try:
         temp_path.write_text(markup, encoding="utf-8")
@@ -334,11 +391,139 @@ def make_html_reader(image_paths: list[Path], html_path: Path) -> None:
         temp_path.unlink(missing_ok=True)
 
 
+def reader_image_paths(html_path: Path, output_root: Path) -> list[Path]:
+    """Resolve and validate every local image referenced by a reader."""
+    markup = html_path.read_text(encoding="utf-8")
+    image_refs = re.findall(r'<img\b[^>]*\bsrc="([^"]+)"', markup)
+    if not image_refs:
+        raise ValueError(f"Chapter reader has no images: {html_path}")
+    root = output_root.resolve()
+    targets = []
+    for raw_ref in image_refs:
+        target = (html_path.parent / unescape(raw_ref)).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            raise ValueError(f"Chapter reader image is missing: {raw_ref}")
+        targets.append(target)
+    return targets
+
+
+def update_reader_navigation(
+    html_path: Path,
+    previous_path: Path | None,
+    next_path: Path | None,
+) -> bool:
+    """Refresh navigation markers without reopening all chapter images."""
+    markup = html_path.read_text(encoding="utf-8")
+    updated = markup
+    for placement in ("top", "bottom"):
+        pattern = re.compile(
+            rf"<!-- reader-nav-{placement}:start -->.*?"
+            rf"<!-- reader-nav-{placement}:end -->",
+            re.DOTALL,
+        )
+        replacement = reader_navigation(html_path, previous_path, next_path, placement)
+        updated, count = pattern.subn(replacement, updated)
+        if count != 1:
+            return False
+    if updated == markup:
+        return True
+    temp_path = html_path.with_suffix(".part.html")
+    try:
+        temp_path.write_text(updated, encoding="utf-8")
+        os.replace(temp_path, html_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return True
+
+
+def has_legacy_layout(output_root: Path) -> bool:
+    """Return whether chapter folders or readers still live at book root."""
+    if not output_root.is_dir():
+        return False
+    return any(
+        (path.is_dir() and CHAPTER_DIRECTORY.fullmatch(path.name))
+        or (path.is_file() and CHAPTER_READER.fullmatch(path.name))
+        for path in output_root.iterdir()
+    )
+
+
+def migrate_legacy_layout(output_root: Path) -> tuple[int, int]:
+    """Move a legacy flat book into images/ and chapters/ with rollback."""
+    if not output_root.is_dir():
+        raise ValueError(f"Book folder does not exist: {output_root}")
+    legacy_directories = sorted(
+        path for path in output_root.iterdir()
+        if path.is_dir() and CHAPTER_DIRECTORY.fullmatch(path.name)
+    )
+    legacy_readers = sorted(
+        path for path in output_root.iterdir()
+        if path.is_file() and CHAPTER_READER.fullmatch(path.name)
+    )
+    if not legacy_directories and not legacy_readers:
+        return 0, 0
+
+    images_root = output_root / IMAGES_DIRECTORY
+    readers_root = output_root / READERS_DIRECTORY
+    directory_moves = [(path, images_root / path.name) for path in legacy_directories]
+    reader_moves = [(path, readers_root / path.name) for path in legacy_readers]
+    for source, destination in directory_moves + reader_moves:
+        if destination.exists():
+            raise ValueError(f"Migration target already exists: {destination}")
+
+    original_markup = {path: path.read_text(encoding="utf-8") for path in legacy_readers}
+    original_images = {
+        path: reader_image_paths(path, output_root) for path in legacy_readers
+    }
+    directory_targets = {
+        source.resolve(): destination for source, destination in directory_moves
+    }
+    mapped_images: dict[Path, list[Path]] = {}
+    for reader, image_paths in original_images.items():
+        mapped = []
+        for image_path in image_paths:
+            for source, destination in directory_targets.items():
+                if image_path.is_relative_to(source):
+                    mapped.append(destination / image_path.relative_to(source))
+                    break
+            else:
+                raise ValueError(f"Reader image is outside a legacy chapter folder: {image_path}")
+        mapped_images[reader] = mapped
+
+    moved: list[tuple[Path, Path]] = []
+    created_roots: list[Path] = []
+    try:
+        for root in (images_root, readers_root):
+            if not root.exists():
+                root.mkdir(parents=True)
+                created_roots.append(root)
+        for source, destination in directory_moves + reader_moves:
+            source.replace(destination)
+            moved.append((source, destination))
+        reader_destinations = dict(reader_moves)
+        for source, image_paths in mapped_images.items():
+            make_html_reader(image_paths, reader_destinations[source])
+    except Exception:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                destination.replace(source)
+        for path, markup in original_markup.items():
+            if path.exists():
+                path.write_text(markup, encoding="utf-8")
+        for root in reversed(created_roots):
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+        raise
+    return len(directory_moves), len(reader_moves)
+
+
 def make_book_index(output_root: Path, book_url: str) -> Path | None:
     """Link completed local chapter readers without depending on PDFs."""
-    readers: dict[int, tuple[Path, int | None]] = {}
-    for html_path in output_root.glob("chapter_*.html"):
-        match = re.fullmatch(r"chapter_(\d{3})(?:_sample(\d+))?\.html", html_path.name)
+    readers: dict[int, tuple[Path, int | None, list[Path]]] = {}
+    readers_root = output_root / READERS_DIRECTORY
+    for html_path in readers_root.glob("chapter_*.html"):
+        match = CHAPTER_READER.fullmatch(html_path.name)
         if match is None:
             continue
         number = int(match.group(1))
@@ -347,27 +532,26 @@ def make_book_index(output_root: Path, book_url: str) -> Path | None:
         if previous is None or (
             previous[1] is not None and (sample is None or sample > previous[1])
         ):
-            readers[number] = (html_path, sample)
+            readers[number] = (html_path, sample, reader_image_paths(html_path, output_root))
     if not readers:
+        if has_legacy_layout(output_root):
+            raise ValueError("Legacy chapter layout found; run with --migrate-layout first")
         return None
 
     rows = []
     total_images = 0
-    root = output_root.resolve()
-    for number, (html_path, sample) in sorted(readers.items()):
-        markup = html_path.read_text(encoding="utf-8")
-        image_refs = re.findall(r'<img\b[^>]*\bsrc="([^"]+)"', markup)
-        if not image_refs:
-            raise ValueError(f"Chapter reader has no images: {html_path}")
-        for raw_ref in image_refs:
-            target = (output_root / unescape(raw_ref)).resolve()
-            if not target.is_relative_to(root) or not target.is_file():
-                raise ValueError(f"Chapter reader image is missing: {raw_ref}")
-        count = len(image_refs)
+    ordered_readers = sorted(readers.items())
+    for position, (number, (html_path, sample, image_paths)) in enumerate(ordered_readers):
+        previous_path = ordered_readers[position - 1][1][0] if position > 0 else None
+        next_path = ordered_readers[position + 1][1][0] if position + 1 < len(ordered_readers) else None
+        if not update_reader_navigation(html_path, previous_path, next_path):
+            make_html_reader(image_paths, html_path, previous_path, next_path)
+        count = len(image_paths)
         label = f"第 {number} 话" + (f"（试读 {sample} 张）" if sample else "")
+        href = html_path.relative_to(output_root).as_posix()
         rows.append(
             f'<tr><th scope="row">{escape(label)}</th><td>{count}</td>'
-            f'<td><a href="{escape(html_path.name, quote=True)}">打开阅读页</a></td></tr>'
+            f'<td><a href="{escape(href, quote=True)}">打开阅读页</a></td></tr>'
         )
         total_images += count
 
@@ -415,7 +599,7 @@ def download_chapter(
     total = len(image_urls)
     if limit is not None:
         image_urls = image_urls[:limit]
-    directory = output_root / f"chapter_{chapter_index + 1:03d}"
+    directory = output_root / IMAGES_DIRECTORY / f"chapter_{chapter_index + 1:03d}"
     directory.mkdir(parents=True, exist_ok=True)
     print(f"Chapter {chapter_index + 1}: {len(image_urls)}/{total} images")
 
@@ -451,7 +635,10 @@ def download_chapter(
         print(f"Continuous PDF: {pdf_path}")
     if html_reader:
         suffix = f"_sample{limit}" if limit is not None else ""
-        html_path = output_root / f"chapter_{chapter_index + 1:03d}{suffix}.html"
+        html_path = (
+            output_root / READERS_DIRECTORY
+            / f"chapter_{chapter_index + 1:03d}{suffix}.html"
+        )
         make_html_reader(ordered_paths, html_path)
         print(f"Seamless HTML: {html_path}")
 
@@ -463,6 +650,10 @@ def main() -> int:
     group.add_argument("--chapter", type=int, help="Chapter index from the URL, starting at 0")
     group.add_argument("--all", action="store_true", help="Download every chapter")
     group.add_argument("--list", action="store_true", help="List chapter indices only")
+    group.add_argument(
+        "--migrate-layout", action="store_true",
+        help="Move an existing flat book into images/ and chapters/ without downloading",
+    )
     parser.add_argument(
         "--out", type=Path, default=DEFAULT_LIBRARY_ROOT,
         help="Parent folder for book downloads (default: %(default)s)",
@@ -486,6 +677,16 @@ def main() -> int:
 
     try:
         book_id, initial_chapter, book_url = parse_book_url(args.url)
+        output_root = book_output_root(args.out, book_id, book_url)
+        if args.migrate_layout:
+            moved_directories, moved_readers = migrate_legacy_layout(output_root)
+            index_path = make_book_index(output_root, book_url)
+            print(
+                f"Migrated layout: {moved_directories} image folders, "
+                f"{moved_readers} chapter readers"
+            )
+            print(f"Offline index: {index_path}")
+            return 0
         if args.all or args.list:
             indices = get_chapters(book_id, book_url)
             print(f"Available chapters ({len(indices)}): {', '.join(map(str, indices))}")
@@ -493,7 +694,8 @@ def main() -> int:
                 return 0
         else:
             indices = [args.chapter if args.chapter is not None else (initial_chapter or 0)]
-        output_root = book_output_root(args.out, book_id, book_url)
+        if has_legacy_layout(output_root):
+            raise ValueError("Legacy chapter layout found; run with --migrate-layout first")
         for index in indices:
             download_chapter(
                 book_url, index, output_root, args.workers, args.limit,

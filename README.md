@@ -1,6 +1,6 @@
 # rouman-chapter-download
 
-一个用于 Rouman 漫画的 Codex skill：下载用户指定的章节图片，按页面顺序编号，并生成无间距的离线 HTML 阅读页和整本目录。默认不生成 PDF。
+一个用于 Rouman 漫画的 Codex skill：下载用户指定的章节图片，按页面顺序编号，并生成带有上一章、目录和下一章导航的无间距离线 HTML 阅读页。默认不生成 PDF。
 
 ## 安装
 
@@ -22,7 +22,30 @@ python skills/rouman-chapter-download/scripts/rouman_downloader.py https://rouma
 
 章节 URL 的 `/0` 对应本地 `chapter_001`。默认将每本漫画存放在运行命令时所在目录的 `downloads/` 下；使用 `--out <目录>` 可自行选择保存位置。章节阅读页直接读取本地图片，整本目录为 `index.html`。
 
+旧版书籍如果把 `chapter_XXX/` 和 `chapter_XXX.html` 直接放在书籍根目录，请先备份，再显式迁移：
+
+```sh
+python skills/rouman-chapter-download/scripts/rouman_downloader.py https://rouman5.com/books/BOOK_ID --migrate-layout --out <漫画库目录>
+```
+
+迁移命令不访问网站，也不重新下载图片。
+
 只有明确需要 PDF 时才使用 `--pdf` 或 `--continuous-pdf`，并另行安装 `reportlab`。
+
+## 下载结果结构
+
+```text
+BOOK_ID/
+├── index.html
+├── images/
+│   ├── chapter_001/
+│   └── chapter_002/
+└── chapters/
+    ├── chapter_001.html
+    └── chapter_002.html
+```
+
+每个章节网页的顶部和底部都提供“上一章 / 目录 / 下一章”导航；尚不存在的方向会显示为不可点击。
 
 ## 仓库结构
 
