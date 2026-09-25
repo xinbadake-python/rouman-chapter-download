@@ -32,3 +32,13 @@ skills/rouman-chapter-download/
 └── scripts/rouman_downloader.py
 requirements.txt
 ```
+
+## 灵感来源
+
+本项目的章节图片下载与离线阅读流程受到
+[lanyeeee/jmcomic-downloader](https://github.com/lanyeeee/jmcomic-downloader)
+启发。代码针对 Rouman 网站以 Python 重新实现，并非原项目的官方分支或发行版。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
